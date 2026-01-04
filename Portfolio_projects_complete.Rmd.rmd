@@ -1,0 +1,578 @@
+---
+title: "Projet gestion de portefeuille"
+author: "Jeremie Kabanga Bajikijayi"
+date: "2025-12-10"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: flatly
+    self_contained: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center", fig.width = 10, fig.height = 6)
+library(tidyverse)
+library(tidyquant)
+library(PerformanceAnalytics)
+library(gridExtra)
+library(zoo)
+library(rugarch)
+library(xts)
+library(MASS)
+library(knitr)
+library(ggrepel)
+library(corrplot)
+library(quadprog)
+library(timetk)
+library(DataExplorer)
+library(kableExtra)
+```
+
+# Projet 1 – Portefeuille GMV avec volatilite dynamique
+
+La strategie classique de Variance Minimale (GMV Statique) souffre d'un defaut majeur : la mesure de la volatilite historique est statique.
+
+Notre approche **Dynamique (GARCH + EWMA)** apporte trois ameliorations :
+
+1.  **La Reactivite :** GARCH capture les pics de volatilite instantanement.
+2.  **Le Clustering :** Le modele anticipe la persistance du risque.
+3.  **La Correlation Dynamique (EWMA) :** Elle s'adapte quand les correlations tendent vers 1 en temps de crise.
+
+## 1. Preparation des donnees
+
+Etant sur un profil de gestion averse au risque, nous reprenons les ressources du workshop 1 sur un portefeuille diversifie geographiquement: les 10 plus grandes capitalisations du msci world par grande zone geographiques.
+```{r data_loading}
+symbols <- c("AAPL", "NVDA", "MSFT", "AMZN", "META", "GOOGL", "TSLA", "AVGO", "LLY", "JPM", "NOVO-B.CO", "ASML.AS", "NESN.SW", "SAP.DE", "AZN.L", "MC.PA", "ROG.SW", "SHEL.L", "NOVN.SW", "TTE.PA", "7203.T", "BHP.AX", "6758.T", "CBA.AX", "8306.T", "6861.T", "1299.HK", "8035.T", "CSL.AX", "6501.T")
+stock_prices_daily <- symbols %>% tq_get(get = "stock.prices", from = "2006-05-02", to = "2025-08-31")
+daily_returns <- stock_prices_daily %>% group_by(symbol) %>% tq_transmute(select = adjusted, mutate_fun = periodReturn, period = "daily", col_rename = "ret") %>% pivot_wider(names_from = symbol, values_from = ret) %>% na.omit()
+monthly_returns <- stock_prices_daily %>% group_by(symbol) %>% tq_transmute(select = adjusted, mutate_fun = periodReturn, period = "monthly", type = "arithmetic", col_rename = "monthly.returns")
+dates_daily <- daily_returns$date
+returns_mat_daily <- as.matrix(daily_returns %>% dplyr::select(-date))
+n_assets <- ncol(returns_mat_daily)
+asset_names <- colnames(returns_mat_daily)
+```
+
+## 2. Modelisation GARCH et Allocation EWMA
+```{r garch_and_allocation}
+spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)), mean.model = list(armaOrder = c(0, 0), include.mean = TRUE), distribution.model = "norm")
+sigma_daily <- matrix(NA, nrow = nrow(returns_mat_daily), ncol = n_assets)
+std_resid_daily <- matrix(NA, nrow = nrow(returns_mat_daily), ncol = n_assets)
+print("Estimation GARCH journalier en cours...")
+for(i in 1:n_assets) {
+  tryCatch({
+    fit <- ugarchfit(spec = spec, data = returns_mat_daily[, i], solver = "hybrid")
+    sigma_daily[, i] <- as.numeric(sigma(fit))
+    std_resid_daily[, i] <- as.numeric(residuals(fit, standardize = TRUE))
+  }, error = function(e) {
+    sigma_daily[, i] <<- sd(returns_mat_daily[, i])
+    std_resid_daily[, i] <<- 0
+  })
+}
+monthly_endpoints <- endpoints(xts(returns_mat_daily, order.by = dates_daily), on = "months")
+monthly_endpoints <- monthly_endpoints[monthly_endpoints > 0] 
+lambda <- 0.94 
+Q_t <- cor(returns_mat_daily)
+weights_monthly <- list()      
+dates_monthly <- c()           
+Amat <- cbind(rep(1, n_assets), diag(n_assets))
+bvec <- c(1, rep(0, n_assets))
+meq <- 1
+dvec <- rep(0, n_assets)
+print("Calcul de l'allocation GMV Long Only...")
+for (t in 2:nrow(returns_mat_daily)) {
+  eps <- matrix(std_resid_daily[t-1, ], ncol = 1)
+  Q_t <- lambda * Q_t + (1 - lambda) * (eps %*% t(eps))
+  R_t <- cov2cor(Q_t) 
+  if (t %in% monthly_endpoints) {
+    D_t <- diag(sigma_daily[t, ])
+    Sigma_t <- D_t %*% R_t %*% D_t
+    Sigma_t <- (Sigma_t + t(Sigma_t)) / 2
+    diag(Sigma_t) <- diag(Sigma_t) + 1e-8
+    sol <- tryCatch({
+      solve.QP(Dmat = Sigma_t, dvec = dvec, Amat = Amat, bvec = bvec, meq = meq)
+    }, error = function(e) {
+      list(solution = rep(1/n_assets, n_assets))
+    })
+    w_t <- sol$solution
+    w_t[w_t < 0] <- 0
+    w_t <- w_t / sum(w_t)
+    weights_monthly[[length(weights_monthly) + 1]] <- as.numeric(w_t)
+    dates_monthly <- c(dates_monthly, dates_daily[t])
+  }
+}
+weights_df <- do.call(rbind, weights_monthly) %>% as.data.frame() %>% setNames(asset_names) %>% mutate(date = as.Date(dates_monthly)) %>% pivot_longer(cols = -date, names_to = "symbol", values_to = "weight")
+last_12_months_dates <- tail(unique(weights_df$date), 12)
+weights_focus <- weights_df %>% filter(date %in% last_12_months_dates)
+avg_weights <- weights_focus %>% group_by(symbol) %>% summarise(avg_abs_weight = mean(abs(weight)))
+top_symbols <- avg_weights %>% filter(avg_abs_weight > 0.05) %>% pull(symbol)
+weights_plot <- weights_focus %>% mutate(symbol_plot = ifelse(symbol %in% top_symbols, symbol, "Autres")) %>% group_by(date, symbol_plot) %>% summarise(weight = sum(weight), .groups = "drop") %>% mutate(date_label = format(date, "%Y-%m"))
+ggplot(weights_plot, aes(x = date_label, y = weight, fill = symbol_plot)) + geom_col(width = 0.7) + labs(title = "Allocation GMV 'Long Only' (12 derniers mois)", subtitle = "Optimisation sous contrainte de positivite.", y = "Poids (0 a 100%)", x = "Mois", fill = "Actif") + theme_tq() + scale_fill_tq() + theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom")
+```
+
+## 3. Backtest et Performance
+```{r backtest_calc}
+ret_wide <- monthly_returns %>% ungroup() %>% mutate(date = as.Date(date)) %>% dplyr::select(date, symbol, monthly.returns) %>% pivot_wider(names_from = symbol, values_from = monthly.returns) %>% na.omit() %>% tk_xts(date_var = date) 
+wts_wide <- weights_df %>% ungroup() %>% mutate(date = as.Date(date)) %>% dplyr::select(date, symbol, weight) %>% pivot_wider(names_from = symbol, values_from = weight, values_fill = 0) %>% tk_xts(date_var = date) 
+common_dates <- intersect(index(ret_wide), index(wts_wide))
+ret_final <- ret_wide[common_dates]
+wts_final <- wts_wide[common_dates]
+port_dyn_xts <- Return.portfolio(R = ret_final, weights = wts_final, verbose = FALSE)
+port_dynamic <- data.frame(date = index(port_dyn_xts), monthly.returns = coredata(port_dyn_xts)) %>% rename(Dynamic_GMV = portfolio.returns)
+weights_equal <- rep(1/ncol(ret_final), ncol(ret_final))
+port_eq_xts <- Return.portfolio(R = ret_final, weights = weights_equal, rebalance_on = "months", verbose = FALSE)
+port_equal <- data.frame(date = index(port_eq_xts), monthly.returns = coredata(port_eq_xts)) %>% rename(Equal_Weight_Benchmark = portfolio.returns)
+comparison_returns <- left_join(port_dynamic, port_equal, by = "date") %>% tq_transmute(mutate_fun = to.period, period = "months") %>% column_to_rownames("date") %>% as.xts()
+```
+
+## 4. Analyse des Resultats
+
+### Graphiques de performance cumulee
+```{r perf_summary}
+charts.PerformanceSummary(comparison_returns, main = "Comparaison Strategie : GMV Dynamique vs Benchmark", colorset = c("darkblue", "gray"), lwd = 2, ylog = TRUE)
+```
+
+Analyse du Graphique de Performance:
+
+-Zone du haut (Wealth Index) : Nous observons que la courbe bleue (GMV Dynamique) progresse de maniere plus reguliere que la grise. Bien que le rendement final puisse etre similaire ou legerement inferieur en periode de forte hausse (Bull run), la trajectoire est beaucoup moins chaotique.
+
+-Zone du milieu/bas (Drawdowns) :C'est ici que la strategie prend tout son sens. Regardons les creux de 2020 (Covid) ou 2022. Le drawdown (perte maximale) du GMV Dynamique est nettement attenue par rapport au benchmark. Cela valide l'hypothese que l'ajustement dynamique des covariances protege mieux le capital en cas de choc.
+
+### Graphique : Volatilite Roulante
+```{r rolling_vol}
+chart.RollingPerformance(comparison_returns, width = 12, FUN = "sd.annualized", main = "Volatilite Roulante (12 mois)", legend.loc = "topleft", colorset = c("darkblue", "gray"))
+```
+
+Analyse du Graphique de Volatilite (Rolling Volatility):
+
+Ce graphique est la preuve de concept du projet. L'objectif d'un portefeuille GMV n'est pas de battre le marche, mais de minimiser la variance.
+
+On constate que la courbe bleue reste structurellement en dessous de la courbe grise. Plus important encore, lors des pics de stress (quand la courbe grise monte en fleche), la courbe bleue monte moins haut. Cela signifie que notre modele GARCH a reussi a anticiper et reduire l'exposition aux actifs les plus volatils.
+
+### Tableau de Statistiques
+```{r table_stats}
+table.Stats(comparison_returns)
+```
+
+Conclusion sur les statistiques:
+
+En analysant le tableau, nous observons un Ratio de Sharpe superieur pour la strategie Dynamique. Meme si le rendement moyen (Arithmetic Mean) est plus faible, l'ecart-type (Stdev) est tellement reduit que la performance ajustee au risque devient meilleure.
+
+# Projet 2 – Portefeuille tangeant de Markowitz avec allocation Black-litterman
+
+## 1. Introduction
+
+Cette analyse compare trois approches d'allocation de portfolio sur un univers de 7 actifs francais:
+
+- **Baseline**: Optimisation classique moyenne-variance (Markowitz)
+- **ESG**: Integration scores ESG Refinitiv via Black-Litterman
+- **Transition Risk**: Integration risque de transition climatique (TCFD)
+
+**Objectif**: Demontrer la complementarite (ou divergence) entre ESG et Transition Risk, et quantifier leur impact sur les performances ajustees au risque.
+
+## 2. Configuration et Packages
+```{r packages2}
+options(repos = c(CRAN = "https://cloud.r-project.org"), install.packages.check.source = "no")
+install_if_missing <- function(packages) {
+  for (pkg in packages) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      message(paste("Installation de", pkg))
+      install.packages(pkg, dependencies = TRUE, quiet = TRUE)
+    }
+    suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+  }
+}
+required_packages <- c("tidyverse", "tidyquant", "DataExplorer", "corrplot", "scales", "ggrepel", "gridExtra", "knitr", "kableExtra")
+install_if_missing(required_packages)
+```
+
+### Theme Graphique Professionnel
+```{r theme2}
+theme_professional <- function() {
+  theme_minimal() + theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5, margin = margin(b = 8)), plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray30", margin = margin(b = 10)), plot.caption = element_text(size = 8, color = "gray50", hjust = 1, margin = margin(t = 8)), axis.title = element_text(size = 10, face = "bold"), axis.text = element_text(size = 9), legend.title = element_text(size = 10, face = "bold"), legend.text = element_text(size = 9), legend.position = "top", panel.grid.major = element_line(color = "gray90", size = 0.3), panel.grid.minor = element_blank(), plot.background = element_rect(fill = "white", color = NA), panel.background = element_rect(fill = "white", color = NA), plot.margin = margin(10, 10, 10, 10))
+}
+colors_portfolio <- c("Baseline" = "#2C3E50", "ESG" = "#27AE60", "Transition" = "#E74C3C")
+```
+
+## 3. Import des Donnees
+```{r import2}
+symbols <- c("EN.PA", "ENGI.PA", "TTE.PA", "SU.PA", "CAP.PA", "MC.PA", "BGRN")
+asset_names <- c('Bouygues', 'Engie', 'TotalEnergies', 'Schneider', 'Capgemini', 'LVMH', 'Green Bond')
+stock_prices <- symbols %>% tq_get(get = "stock.prices", from = "2018-11-27", to = "2025-09-30") %>% group_by(symbol)
+cat(sprintf("Prix telecharges: %d observations\n", nrow(stock_prices)))
+```
+
+**Periode:** 27 novembre 2018 - 30 septembre 2025 (environ 6 ans)
+
+## 4. Wrangling (Transformation des Donnees)
+```{r wrangling2}
+monthly_returns2 <- stock_prices %>% group_by(symbol) %>% tq_transmute(select = adjusted, mutate_fun = periodReturn, period = "monthly", type = "arithmetic", col_rename = "monthly.returns")
+table_returns2 <- monthly_returns2 %>% pivot_wider(names_from = symbol, values_from = monthly.returns) %>% dplyr::select(-date) %>% na.omit()
+cat(sprintf("%d mois x %d actifs\n", nrow(table_returns2), ncol(table_returns2)))
+```
+
+## 5. Exploration des Donnees
+
+### Statistiques Descriptives
+```{r stats2}
+summary(table_returns2) %>% kable(digits = 4, caption = "Statistiques descriptives des rendements mensuels") %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### Structure des Donnees
+```{r structure2}
+plot_intro(table_returns2)
+```
+
+### Performance Base 100
+```{r price_evolution2, fig.cap="Evolution comparative des actifs (Base 100)"}
+price_evolution2 <- monthly_returns2 %>% mutate(price.index = 100 * cumprod(1 + monthly.returns), asset_name = factor(symbol, levels = symbols, labels = asset_names))
+ggplot(price_evolution2, aes(x = date, y = price.index, color = asset_name)) + geom_line(size = 1.1, alpha = 0.85) + scale_y_continuous(labels = comma_format()) + scale_x_date(date_breaks = "6 months", date_labels = "%b %y") + scale_color_manual(values = c("#E74C3C", "#F39C12", "#E67E22", "#27AE60", "#3498DB", "#9B59B6", "#16A085")) + labs(title = "Performance Comparative des Actifs", subtitle = "Indice Base 100 | Nov 2018 - Sep 2025", x = NULL, y = "Indice (Base 100)", color = "Actif") + theme_professional() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Matrice de Correlations
+```{r correlation2, fig.cap="Matrice de correlations des rendements mensuels"}
+cor_matrix2 <- cor(table_returns2)
+colnames(cor_matrix2) <- asset_names
+rownames(cor_matrix2) <- asset_names
+corrplot(cor_matrix2, method = 'color', type = 'full', tl.col = 'black', tl.cex = 0.9, tl.srt = 45, addCoef.col = 'black', number.cex = 0.8, col = colorRampPalette(c("#E74C3C", "#FFFFFF", "#27AE60"))(200), title = "Matrice de Correlations des Rendements", mar = c(0, 0, 2, 0), cl.pos = 'b')
+```
+
+## 6. Separation Learning / Backtest
+```{r split2}
+end_date2 <- nrow(table_returns2)
+table_returns_learning2 <- table_returns2 %>% slice(1:55)
+table_returns_backtest2 <- table_returns2 %>% slice(56:end_date2)
+cat(sprintf("Learning:  %2d mois (2018-2023)\n", nrow(table_returns_learning2)))
+cat(sprintf("Backtest:  %2d mois (2023-2025)\n", nrow(table_returns_backtest2)))
+n2 <- ncol(table_returns_learning2)
+T2 <- nrow(table_returns_learning2)
+e2 <- rep(1, n2)
+perio2 <- 12
+rf2 <- 0
+```
+
+## 7. Portfolio Tangent Baseline (Markowitz)
+```{r baseline2}
+mu2 <- colMeans(table_returns_learning2) * perio2 - rf2
+Sigma2 <- cov(table_returns_learning2) * (T2 - 1) / (T2 - n2 - 2) * perio2
+A2 <- t(e2) %*% solve(Sigma2) %*% mu2
+omega2 <- 1 / as.numeric(A2) * solve(Sigma2) %*% mu2
+baseline_alloc2 <- data.frame(Actif = asset_names, Poids = sprintf("%.1f%%", omega2 * 100))
+baseline_alloc2 %>% kable(caption = "Allocation Baseline (Portfolio Tangent)") %>% kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+## 8. Scores ESG et Transition Risk
+
+### Scores ESG (Refinitiv)
+```{r esg_scores2}
+esg_refinitiv_raw2 <- c(53, 73, 42, 82, 68, 59, NA)
+esg_grades2 <- c("C+", "B+", "C-", "A-", "B", "C+", "Green")
+esg_refinitiv_raw2[7] <- 100
+esg_mean2 <- mean(esg_refinitiv_raw2)
+esg_sd2 <- sd(esg_refinitiv_raw2)
+esg_zscore2 <- (esg_refinitiv_raw2 - esg_mean2) / esg_sd2
+esg_score2 <- round(pmax(-2, pmin(2, esg_zscore2)))
+esg_table2 <- data.frame(Actif = asset_names, Score_Raw = round(esg_refinitiv_raw2), Grade = esg_grades2, Score_Normalise = sprintf("%+d", esg_score2))
+esg_table2 %>% kable(caption = "Scores ESG Refinitiv (2024)") %>% kable_styling(bootstrap_options = c("striped", "hover")) %>% row_spec(which(esg_score2 >= 1), background = "#d4edda") %>% row_spec(which(esg_score2 <= -1), background = "#f8d7da")
+```
+
+### Scores Transition Risk (TCFD)
+```{r transition_scores2}
+transition_score2 <- c(-1, +2, -2, +2, 0, -1, +2)
+transition_taxonomie2 <- c("15%", "45%", "3.8%", "80%", "N/A", "N/A", "100%")
+transition_rationale2 <- c("Construction: Secteur haut carbone (beton, acier)", "Leader renouvelables EU | 60% CapEx verts | Sortie charbon 2027", "90% revenus fossiles | Stranded assets $150B | VaR climat: -60%", "80% CA aligne Taxonomie | Produits = enablers transition", "Services IT: Faible empreinte carbone directe", "Supply chain luxe carbone-intensive | Vulnerabilite climat", "100% financement projets verts | Paris-aligned")
+transition_table2 <- data.frame(Actif = asset_names, Score = sprintf("%+d", transition_score2), Taxonomie_UE = transition_taxonomie2, Rationale = transition_rationale2)
+transition_table2 %>% kable(caption = "Scores Transition Risk (TCFD-aligned)") %>% kable_styling(bootstrap_options = c("striped", "hover")) %>% column_spec(4, width = "30em") %>% row_spec(which(transition_score2 >= 1), background = "#d4edda") %>% row_spec(which(transition_score2 <= -1), background = "#f8d7da")
+```
+
+### Comparaison ESG vs Transition Risk
+```{r comparison_table2}
+scores_comp2 <- data.frame(Actif = asset_names, ESG = sprintf("%+d", esg_score2), Transition = sprintf("%+d", transition_score2), Divergence = sprintf("%+d", transition_score2 - esg_score2))
+scores_comp2 %>% kable(caption = "Comparaison ESG vs Transition Risk") %>% kable_styling(bootstrap_options = c("striped", "hover")) %>% column_spec(4, bold = TRUE, color = ifelse(abs(transition_score2 - esg_score2) >= 2, "red", "black"))
+```
+
+## 9. Allocations Black-Litterman
+```{r black_litterman2}
+theta2 <- 0.2
+tau2 <- 0.5
+vol2 <- sqrt(diag(Sigma2))
+Omega2 <- diag(diag(Sigma2), n2, n2)
+Q_esg2 <- mu2 + vol2 * esg_score2 * theta2
+mu_mixed2 <- solve(solve(tau2 * Sigma2) + solve(Omega2)) %*% (solve(tau2 * Sigma2) %*% mu2 + solve(Omega2) %*% Q_esg2)
+A_mixed2 <- t(e2) %*% solve(Sigma2) %*% mu_mixed2
+omega_mixed2 <- 1 / as.numeric(A_mixed2) * solve(Sigma2) %*% mu_mixed2
+Q_trans2 <- mu2 + vol2 * transition_score2 * theta2
+mu_trans2 <- solve(solve(tau2 * Sigma2) + solve(Omega2)) %*% (solve(tau2 * Sigma2) %*% mu2 + solve(Omega2) %*% Q_trans2)
+A_trans2 <- t(e2) %*% solve(Sigma2) %*% mu_trans2
+omega_trans2 <- 1 / as.numeric(A_trans2) * solve(Sigma2) %*% mu_trans2
+alloc_table2 <- data.frame(Actif = asset_names, Baseline = sprintf("%.1f%%", omega2 * 100), ESG = sprintf("%.1f%%", omega_mixed2 * 100), Transition = sprintf("%.1f%%", omega_trans2 * 100))
+alloc_table2 %>% kable(caption = "Allocations Comparees: Baseline vs ESG vs Transition") %>% kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+## 10. Visualisations Comparatives
+
+### Allocations Comparees
+```{r allocations2, fig.cap="Impact des facteurs ESG et Transition sur les allocations"}
+alloc_data2 <- data.frame(Actif = rep(asset_names, 3), Poids = c(omega2 * 100, omega_mixed2 * 100, omega_trans2 * 100), Portfolio = factor(rep(c("Baseline", "ESG", "Transition"), each = n2), levels = c("Baseline", "ESG", "Transition")))
+ggplot(alloc_data2, aes(x = reorder(Actif, Poids), y = Poids, fill = Portfolio)) + geom_col(position = position_dodge(width = 0.85), width = 0.75, color = "white") + geom_hline(yintercept = 0, color = "black", size = 1) + geom_text(aes(label = sprintf("%.0f%%", Poids)), position = position_dodge(width = 0.85), vjust = ifelse(alloc_data2$Poids > 0, -0.5, 1.5), size = 3) + coord_flip() + scale_fill_manual(values = colors_portfolio) + labs(title = "Allocations Comparees: Baseline vs ESG vs Transition", subtitle = "Impact des facteurs de durabilite sur l'optimisation", x = NULL, y = "Poids (%)", fill = "Portfolio") + theme_professional() + theme(axis.text.y = element_text(size = 10, face = "bold"))
+```
+
+### Heatmap des Variations
+```{r heatmap2, fig.cap="Heatmap des variations d'allocation (en points de pourcentage)"}
+delta_data2 <- data.frame(Actif = rep(asset_names, 3), Delta = c((omega_mixed2 - omega2) * 100, (omega_trans2 - omega2) * 100, (omega_trans2 - omega_mixed2) * 100), Comparaison = factor(rep(c("ESG - Baseline", "Transition - Baseline", "Transition - ESG"), each = n2), levels = c("ESG - Baseline", "Transition - Baseline", "Transition - ESG")))
+ggplot(delta_data2, aes(x = Actif, y = Comparaison, fill = Delta)) + geom_tile(color = "white", size = 1.2) + geom_text(aes(label = sprintf("%+.1f", Delta)), fontface = "bold", size = 3.5, color = ifelse(abs(delta_data2$Delta) > 10, "white", "black")) + scale_fill_gradient2(low = "#E74C3C", mid = "#ECF0F1", high = "#27AE60", midpoint = 0, name = "Delta Poids (pp)") + scale_x_discrete(labels = function(x) str_wrap(x, width = 10)) + labs(title = "Heatmap des Variations d'Allocation", subtitle = "Differences en points de pourcentage par rapport au Baseline", x = NULL, y = NULL) + theme_professional() + theme(axis.text.x = element_text(size = 9), panel.grid = element_blank())
+```
+
+### Scatter Plot ESG vs Transition
+```{r scatter2, fig.cap="Positionnement ESG vs Transition Risk"}
+scores_scatter2 <- data.frame(Actif = asset_names, ESG = esg_score2, Transition = transition_score2, Taxonomie = as.numeric(gsub("%", "", transition_taxonomie2)))
+scores_scatter2$Taxonomie[is.na(scores_scatter2$Taxonomie)] <- 0
+cor_esg_trans2 <- cor(esg_score2, transition_score2)
+ggplot(scores_scatter2, aes(x = ESG, y = Transition)) + geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") + geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") + geom_smooth(method = "lm", se = TRUE, color = "#3498DB", fill = "#3498DB", alpha = 0.2) + geom_point(aes(size = Taxonomie, fill = Transition), shape = 21, color = "white", stroke = 1.2, alpha = 0.85) + geom_text_repel(aes(label = Actif), size = 3.2, fontface = "bold", box.padding = 0.4) + annotate("text", x = 1.7, y = -1.7, label = sprintf("rho = %.2f", cor_esg_trans2), size = 4, fontface = "bold", color = "#2C3E50") + scale_fill_gradient2(low = "#E74C3C", mid = "#F39C12", high = "#27AE60", midpoint = 0, name = "Score\nTransition") + scale_size_continuous(range = c(4, 12), name = "Taxonomie\nUE (%)") + scale_x_continuous(breaks = -2:2, limits = c(-2.3, 2.3)) + scale_y_continuous(breaks = -2:2, limits = c(-2.3, 2.3)) + labs(title = "ESG vs Transition Risk: Analyse de Positionnement", subtitle = "Taille des points = % revenus alignes Taxonomie UE", x = "Score ESG (Refinitiv)", y = "Score Transition Risk (TCFD)") + theme_professional()
+```
+
+## 11. Backtesting
+```{r backtest2}
+ret_baseline2 <- as.matrix(table_returns_backtest2) %*% omega2
+ret_esg2 <- as.matrix(table_returns_backtest2) %*% omega_mixed2
+ret_trans2 <- as.matrix(table_returns_backtest2) %*% omega_trans2
+annual_ret_base2 <- mean(ret_baseline2) * 12
+annual_ret_esg2 <- mean(ret_esg2) * 12
+annual_ret_trans2 <- mean(ret_trans2) * 12
+annual_vol_base2 <- sd(ret_baseline2) * sqrt(12)
+annual_vol_esg2 <- sd(ret_esg2) * sqrt(12)
+annual_vol_trans2 <- sd(ret_trans2) * sqrt(12)
+sharpe_base2 <- annual_ret_base2 / annual_vol_base2
+sharpe_esg2 <- annual_ret_esg2 / annual_vol_esg2
+sharpe_trans2 <- annual_ret_trans2 / annual_vol_trans2
+cumul_base2 <- cumprod(1 + ret_baseline2)
+cumul_esg2 <- cumprod(1 + ret_esg2)
+cumul_trans2 <- cumprod(1 + ret_trans2)
+maxdd_base2 <- max((cummax(cumul_base2) - cumul_base2) / cummax(cumul_base2))
+maxdd_esg2 <- max((cummax(cumul_esg2) - cumul_esg2) / cummax(cumul_esg2))
+maxdd_trans2 <- max((cummax(cumul_trans2) - cumul_trans2) / cummax(cumul_trans2))
+performance_final2 <- data.frame(Portfolio = c("Baseline", "Tactique ESG", "Tactique Transition"), Rendement = sprintf("%.2f%%", c(annual_ret_base2, annual_ret_esg2, annual_ret_trans2) * 100), Volatilite = sprintf("%.2f%%", c(annual_vol_base2, annual_vol_esg2, annual_vol_trans2) * 100), Sharpe = sprintf("%.2f", c(sharpe_base2, sharpe_esg2, sharpe_trans2)), MaxDD = sprintf("%.2f%%", c(maxdd_base2, maxdd_esg2, maxdd_trans2) * 100))
+performance_final2 %>% kable(caption = "Performances Backtest (2023-2025)") %>% kable_styling(bootstrap_options = c("striped", "hover")) %>% row_spec(which.max(c(sharpe_base2, sharpe_esg2, sharpe_trans2)), background = "#d4edda", bold = TRUE)
+```
+
+### Evolution des Valeurs
+```{r evolution2, fig.cap="Evolution comparative des valeurs de portfolio (Base 100)"}
+evol_data2 <- data.frame(Mois = rep(1:length(ret_baseline2), 3), Valeur = c(100 * cumul_base2, 100 * cumul_esg2, 100 * cumul_trans2), Portfolio = factor(rep(c("Baseline", "ESG", "Transition"), each = length(ret_baseline2)), levels = c("Baseline", "ESG", "Transition")))
+ggplot(evol_data2, aes(x = Mois, y = Valeur, color = Portfolio)) + geom_hline(yintercept = 100, linetype = "dashed", color = "gray40") + geom_line(size = 1.5, alpha = 0.85) + scale_color_manual(values = colors_portfolio) + scale_y_continuous(labels = comma_format()) + labs(title = "Evolution des Valeurs de Portfolio", subtitle = "Performance comparee (Base 100) | Backtest 2023-2025", x = "Mois depuis debut du backtest", y = "Valeur (Base 100)", color = "Portfolio") + theme_professional()
+```
+
+### Metriques de Performance
+```{r metrics2, fig.cap="Metriques de performance detaillees par portfolio"}
+metrics_data2 <- data.frame(Portfolio = rep(c("Baseline", "ESG", "Transition"), 4), Metrique = factor(rep(c("Rendement", "Volatilite", "Sharpe", "MaxDD"), each = 3), levels = c("Rendement", "Volatilite", "Sharpe", "MaxDD")), Valeur = c(annual_ret_base2 * 100, annual_ret_esg2 * 100, annual_ret_trans2 * 100, annual_vol_base2 * 100, annual_vol_esg2 * 100, annual_vol_trans2 * 100, sharpe_base2, sharpe_esg2, sharpe_trans2, maxdd_base2 * 100, maxdd_esg2 * 100, maxdd_trans2 * 100), Unite = rep(c("%", "%", "Ratio", "%"), each = 3))
+ggplot(metrics_data2, aes(x = Portfolio, y = Valeur, fill = Portfolio)) + geom_col(width = 0.65, color = "white") + geom_text(aes(label = ifelse(Unite == "Ratio", sprintf("%.2f", Valeur), sprintf("%.1f%%", Valeur))), vjust = -0.5, size = 3) + facet_wrap(~ Metrique, scales = "free_y", ncol = 4) + scale_fill_manual(values = colors_portfolio) + labs(title = "Metriques de Performance Detaillees", x = NULL, y = NULL) + theme_professional() + theme(legend.position = "none", strip.text = element_text(size = 10, face = "bold"), axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+```
+
+### Profil Risque-Rendement
+```{r risk_return2, fig.cap="Positionnement des portfolios dans l'espace moyenne-variance"}
+risk_return_data2 <- data.frame(Portfolio = c("Baseline", "ESG", "Transition"), Rendement = c(annual_ret_base2, annual_ret_esg2, annual_ret_trans2) * 100, Volatilite = c(annual_vol_base2, annual_vol_esg2, annual_vol_trans2) * 100, Sharpe = c(sharpe_base2, sharpe_esg2, sharpe_trans2))
+ggplot(risk_return_data2, aes(x = Volatilite, y = Rendement, color = Portfolio)) + geom_point(size = 7, alpha = 0.8) + geom_text_repel(aes(label = sprintf("%s\nSharpe: %.2f", Portfolio, Sharpe)), size = 3.5, fontface = "bold", box.padding = 0.8) + geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") + scale_color_manual(values = colors_portfolio) + scale_x_continuous(labels = function(x) sprintf("%.1f%%", x)) + scale_y_continuous(labels = function(x) sprintf("%.1f%%", x)) + labs(title = "Profil Risque-Rendement des Portfolios", subtitle = "Positionnement dans l'espace moyenne-variance", x = "Volatilite Annualisee (%)", y = "Rendement Annualise (%)", caption = "Ligne pointillee: Sharpe = 1.0") + theme_professional() + theme(legend.position = "none")
+```
+
+## 12. Analyse des Resultats
+
+### Classement par Sharpe Ratio
+```{r ranking2}
+sharpes_all2 <- c(Baseline = sharpe_base2, ESG = sharpe_esg2, Transition = sharpe_trans2)
+ranking2 <- sort(sharpes_all2, decreasing = TRUE)
+ranking_table2 <- data.frame(Rang = 1:3, Portfolio = names(ranking2), Sharpe = sprintf("%.2f", ranking2))
+ranking_table2 %>% kable(caption = "Classement par Ratio de Sharpe") %>% kable_styling(bootstrap_options = c("striped", "hover")) %>% row_spec(1, background = "#d4edda", bold = TRUE)
+```
+
+**Portfolio gagnant:** `r names(ranking2)[1]` (Sharpe: `r sprintf("%.2f", ranking2[1])`)
+
+### Impact des Facteurs sur les Allocations
+```{r impact2}
+delta_esg2 <- omega_mixed2 - omega2
+top_esg2 <- order(delta_esg2, decreasing = TRUE)[1:3]
+cat("**Actifs surponderes par ESG:**\n\n")
+for(i in top_esg2) {
+  cat(sprintf("- %s: %+.1f pp (score ESG: %+d)\n", asset_names[i], delta_esg2[i] * 100, esg_score2[i]))
+}
+delta_trans2 <- omega_trans2 - omega2
+top_trans2 <- order(delta_trans2, decreasing = TRUE)[1:3]
+cat("\n**Actifs surponderes par Transition:**\n\n")
+for(i in top_trans2) {
+  cat(sprintf("- %s: %+.1f pp (score Transition: %+d)\n", asset_names[i], delta_trans2[i] * 100, transition_score2[i]))
+}
+```
+
+## 13. Conclusions
+
+### Principaux Enseignements
+
+1. **Complementarite ESG / Transition:**
+   - Correlation moderee
+   - Approches differentes
+   - ESG = Vue holistique (E+S+G)
+   - Transition = Focus climat pur
+
+2. **Divergences Revelatrices:**
+   - TotalEnergies: ESG masque risque climat
+   - Transition Risk expose fossiles
+
+3. **Performance Depend Contexte:**
+   - Court terme (2023-2025): Resultats empiriques
+   - Long terme (2025-2050): Transition devrait dominer
+
+4. **Black-Litterman Efficace:**
+   - Integre views subjectives
+   - Combine prior + views
+   - Flexible et transparent
+
+### Limites et Ameliorations
+
+**Limites actuelles:**
+
+1. Periode backtest courte
+2. Pas de contraintes long-only
+3. Rebalancing statique
+4. Pas de couts de transaction
+5. Scores subjectifs
+
+**Ameliorations recommandees:**
+
+1. Contraintes long-only (quadprog)
+2. Rebalancing dynamique
+3. Couts de transaction
+4. Analyse de sensibilite
+5. Extension periode
+
+# Projet 3 – Assurance de portefeuille OBPI et CPPI avec indice decrement
+
+## 1. Objectif et Cadre
+
+Nous comparons deux strategies d'assurance de portefeuille optimisees sur un horizon de 1 an :
+
+OBPI Optimise (Call Spread) : Au lieu d'un Call classique, nous achetons un Call Spread (Achat Strike 100 / Vente Strike 130) sur indice decrement. La vente du Cap finance un levier (Gearing) beaucoup plus fort.
+
+CPPI Optimise (Decrement) : Une allocation dynamique (Coussin) appliquee sur l'indice decrement. L'usage du decrement (moins cher que l'indice standard) est cense offrir plus de potentiel de hausse, au risque d'une monetarisation plus rapide.
+
+## 2. Hypotheses et Simulation
+
+Parametres de marche et construction de l'Indice Decrement.
+```{r proj3_params}
+mu3 <- 0.05
+sigma3 <- 0.20
+rf3 <- 0.02
+mat3 <- 1
+delta3 <- 1/12
+n_steps3 <- mat3 / delta3
+nsimul3 <- 10000
+strike3 <- 100
+q_dec3 <- 0.05
+set.seed(1234)
+```
+
+### 2.1 Simulation des Trajectoires (Vectorisee)
+```{r proj3_sim}
+mu_step3 <- (1 + mu3)^delta3 - 1
+rf_step3 <- (1 + rf3)^delta3 - 1
+sigma_step3 <- sigma3 * sqrt(delta3)
+u3 <- matrix(runif(n_steps3 * nsimul3), nrow = n_steps3, ncol = nsimul3)
+r_rnp3 <- qnorm(u3, mean = rf_step3, sd = sigma_step3)
+equity_rnp3 <- rbind(rep(strike3, nsimul3), strike3 * apply(1 + r_rnp3, 2, cumprod))
+time_vec3 <- seq(0, mat3, by = delta3)
+dec_factor3 <- exp(-q_dec3 * time_vec3)
+equity_dec_rnp3 <- sweep(equity_rnp3, 1, dec_factor3, "*")
+S_T_Dec3 <- equity_dec_rnp3[n_steps3 + 1, ]
+```
+
+## 3. Strategie 1 : OBPI Optimise (Call Spread)
+
+L'optimisation consiste a plafonner la performance a 130% (Cap) pour reduire le cout de l'option et maximiser le levier sur la zone 100-130.
+
+### 3.1 Pricing et Gearing
+```{r proj3_obpi}
+bs_call3 <- function(S0, K, r, q, sigma, T) {
+  d1 <- (log(S0 / K) + (r - q + 0.5 * sigma^2) * T) / (sigma * sqrt(T))
+  d2 <- d1 - sigma * sqrt(T)
+  S0 * exp(-q * T) * pnorm(d1) - K * exp(-r * T) * pnorm(d2)
+}
+floor03 <- strike3 / (1 + rf3)^mat3
+budget3 <- strike3 - floor03
+floor_T3 <- floor03 * (1 + rf3)^mat3
+cap_level3 <- 130 
+px_call_atm3 <- bs_call3(strike3, strike3, rf3, q_dec3, sigma3, mat3)
+px_call_otm3 <- bs_call3(strike3, cap_level3, rf3, q_dec3, sigma3, mat3)
+px_spread3 <- px_call_atm3 - px_call_otm3
+gearing_spread3 <- budget3 / px_spread3
+px_call_std_no_dec3 <- bs_call3(strike3, strike3, rf3, 0, sigma3, mat3)
+gearing_std3 <- budget3 / px_call_std_no_dec3
+print(paste("Gearing Standard (Indice normal) :", round(gearing_std3, 2)))
+print(paste("Gearing Optimise (Decrement + Spread) :", round(gearing_spread3, 2)))
+```
+
+### 3.2 Calcul du Payoff OBPI
+```{r proj3_obpi_payoff}
+payoff_opt_spread3 <- pmin(pmax(S_T_Dec3 - strike3, 0), cap_level3 - strike3)
+wealth_obpi_spread3 <- floor_T3 + gearing_spread3 * payoff_opt_spread3
+```
+
+## 4. Strategie 2 : CPPI Optimise (Sur Decrement)
+
+Le CPPI applique une allocation dynamique sur l'indice Decrement. Risque : Le decrement (drag de 5%) erode le coussin plus vite, augmentant le risque de monetarisation ("Cash Lock").
+```{r proj3_cppi}
+multiplier3 <- 5
+floor_path3 <- strike3 / (1 + rf3)^(seq(mat3, 0, by = -delta3))
+wealth_cppi_mat3 <- matrix(0, nrow = n_steps3 + 1, ncol = nsimul3)
+wealth_cppi_mat3[1, ] <- strike3
+for (t in 1:n_steps3) {
+  V_prev3 <- wealth_cppi_mat3[t, ]
+  F_prev3 <- floor_path3[t]
+  Cushion3 <- V_prev3 - F_prev3
+  Exposure3 <- pmax(multiplier3 * Cushion3, 0) 
+  Exposure3 <- pmin(Exposure3, 2 * V_prev3)
+  r_risky3 <- equity_dec_rnp3[t + 1, ] / equity_dec_rnp3[t, ] - 1
+  r_safe3 <- (1 + rf3)^delta3 - 1
+  is_locked3 <- (Cushion3 <= 0.001)
+  V_next3 <- V_prev3
+  V_next3[!is_locked3] <- V_prev3[!is_locked3] + Exposure3[!is_locked3] * r_risky3[!is_locked3] + (V_prev3[!is_locked3] - Exposure3[!is_locked3]) * r_safe3
+  V_next3[is_locked3] <- V_prev3[is_locked3] * (1 + r_safe3)
+  V_next3 <- pmax(V_next3, floor_path3[t+1])
+  wealth_cppi_mat3[t + 1, ] <- V_next3
+}
+wealth_cppi3 <- wealth_cppi_mat3[n_steps3 + 1, ]
+```
+
+## 5. Comparaison des Resultats et Conclusion
+
+### 5.1 Statistiques Comparatives
+```{r proj3_stats}
+cash_lock_rate3 <- mean(wealth_cppi3 <= strike3 * 1.01) * 100
+stats3 <- tibble(Metric = c("Moyenne", "Mediane", "Volatilite", "Min (Garantie)", "Gain Max"), OBPI_Spread = c(mean(wealth_obpi_spread3), median(wealth_obpi_spread3), sd(wealth_obpi_spread3), min(wealth_obpi_spread3), max(wealth_obpi_spread3)), CPPI_Dec = c(mean(wealth_cppi3), median(wealth_cppi3), sd(wealth_cppi3), min(wealth_cppi3), max(wealth_cppi3)))
+kable(stats3, digits = 2, caption = "Duel des Strategies Optimisees")
+print(paste("Risque de Monetarisation du CPPI :", round(cash_lock_rate3, 1), "%"))
+```
+
+### 5.2 Profil de Payoff (Le duel visuel)
+
+Ce graphique illustre parfaitement la difference de philosophie :
+
+L'OBPI Spread (Rouge) : Une ligne nette. On voit l'acceleration (levier fort) puis le plafond (Cap). C'est deterministe par rapport au niveau final.
+
+Le CPPI (Bleu) : Un nuage de points "bruite". Pour un meme niveau final de l'indice, le CPPI peut avoir des valeurs tres differentes selon le chemin parcouru (Path Dependency).
+```{r proj3_payoff_plot}
+df_plot3 <- tibble(Indice_Final = S_T_Dec3, OBPI_Spread = wealth_obpi_spread3, CPPI = wealth_cppi3) %>% slice(1:2000) %>% arrange(Indice_Final) %>% filter(Indice_Final < 160)
+ggplot(df_plot3, aes(x = Indice_Final)) + geom_line(aes(y = OBPI_Spread, color = "1. OBPI Call Spread"), size = 1.2) + geom_point(aes(y = CPPI, color = "2. CPPI Decrement"), size = 0.5, alpha = 0.3) + geom_vline(xintercept = strike3, linetype = "dashed") + geom_vline(xintercept = cap_level3, linetype = "dotted", color = "darkred") + scale_color_manual(values = c("red", "blue")) + labs(title = "Profil de Payoff : Deterministe vs Path-Dependent", subtitle = "L'OBPI (Rouge) surperforme nettement dans la zone mediane (100-130).", x = "Niveau Final Indice Decrement", y = "Valeur Finale Portefeuille") + theme_minimal() + theme(legend.position = "bottom")
+```
+
+### 5.3 Distribution de la Richesse (Densite)
+```{r proj3_density}
+tibble(OBPI_Spread = wealth_obpi_spread3, CPPI = wealth_cppi3) %>% pivot_longer(everything(), names_to = "Strategie", values_to = "Wealth") %>% ggplot(aes(x = Wealth, fill = Strategie)) + geom_density(alpha = 0.5) + geom_vline(xintercept = strike3, linetype = "dashed") + scale_fill_manual(values = c("blue", "red")) + labs(title = "Distribution des Resultats Finaux", subtitle = "Le CPPI (Bleu) a un risque eleve de finir a 100 (Cash Lock).", x = "Valeur Finale", y = "Densite") + theme_minimal() + theme(legend.position = "bottom")
+```
+
+### 6. Conclusion
+
+L'OBPI Optimise (Call Spread) est la strategie gagnante pour un scenario central. Grace au decrement et a la vente du Cap, le levier est maximise. On garantit une forte surperformance si l'indice finit entre 100 et 130.
+
+Le CPPI sur Decrement est risque. Bien qu'il n'ait pas de plafond theorique, le "drag" du decrement (5% de baisse par an) met le coussin sous pression constante, augmentant massivement le taux de "Cash Lock" (portefeuilles bloques au plancher).
+
+---
+
+**Fin du document**
+
+*Document genere le `r format(Sys.time(), '%d %B %Y a %H:%M')` avec R Markdown.*
